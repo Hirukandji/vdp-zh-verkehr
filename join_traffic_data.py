@@ -1,135 +1,131 @@
 """
 Wird alle 15 Minuten von GitHub Actions ausgeführt.
-Holt die Aggregationsdaten von VDP-ZH, verknüpft sie über die uID mit den
-358 festen Geodaten-Punkten (stations.json) und schreibt das Ergebnis als
-latest.json, die das Frontend danach lädt.
+Fragt für jede der 358 Messstellen einzeln die aktuelle Verkehrsmenge bei
+VDP-ZH ab (ein Request pro Messstelle, wie es die API laut Swagger-UI
+verlangt: /readOnlineAggregationData/VDP/{uid}?sampleOnly=true) und
+schreibt das Ergebnis als latest.json, die das Frontend danach lädt.
 """
 
 import json
 import os
-import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-AGGREGATION_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData"
+BASE_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData"
 STATIONS_FILE = "stations.json"   # deine 358 Messstellen, id = MESSST_NR
 OUTPUT_FILE = "latest.json"
+REQUEST_DELAY_SECONDS = 0.15      # kleine Pause zwischen Requests, aus Fairness gegenüber dem Server
+REQUEST_TIMEOUT_SECONDS = 10
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; vdp-zh-sync/1.0)",
+    "Accept": "application/json",
+}
 
 
-def extract_numeric_id(uid_like) -> int | None:
-    """
-    Zieht aus einer uID wie "M01190" (oder einem {id, sub}-Objekt) die reine
-    Zahl 1190. Robust gegen unbekanntes Präfix/Padding — wir wissen nicht
-    sicher, ob die echte uID "M0" + Zahl ist oder anders aussieht.
-    """
-    raw = uid_like.get("id") if isinstance(uid_like, dict) else uid_like
-    if raw is None:
-        return None
-    digits = re.sub(r"\D", "", str(raw)).lstrip("0")
-    return int(digits) if digits else None
+def uid_for(station_id: int) -> str:
+    # Bestätigtes Format aus der Swagger-UI: "M0" + Messstellen-Nummer, z.B. M0197
+    return f"M0{station_id}"
 
 
-def load_stations() -> dict[int, dict]:
+def load_stations() -> list[dict]:
     if not os.path.isfile(STATIONS_FILE):
         sys.exit(
             f"FEHLER: '{STATIONS_FILE}' wurde im Repository nicht gefunden. "
             "Liegt die Datei im Hauptordner (gleiche Ebene wie dieses Skript)?"
         )
     with open(STATIONS_FILE, encoding="utf-8") as f:
-        stations = json.load(f)
-    return {s["id"]: s for s in stations}
+        return json.load(f)
 
 
-def fetch_aggregation_data() -> list[dict]:
-    # Ohne echten User-Agent blocken manche Server/WAFs die Anfrage mit 403,
-    # weil Pythons Standard-Header ("Python-urllib/3.x") als Bot erkannt wird.
-    request = urllib.request.Request(
-        AGGREGATION_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; vdp-zh-sync/1.0)",
-            "Accept": "application/json",
-        },
-    )
+def sum_flow(payload) -> float | None:
+    """
+    Eine Antwort kann ein einzelnes AggVdp-Objekt oder eine Liste davon sein.
+    Innerhalb hat jede Fahrzeugklasse ihre eigene Statistik (AggVdpDetail mit
+    u.a. 'flow') — wir summieren über alle Klassen zu einem Gesamtwert.
+    """
+    entries = payload if isinstance(payload, list) else [payload]
+    total = 0.0
+    found = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        stats = entry.get("statistics") or entry.get("details") or []
+        if stats:
+            for s in stats:
+                total += s.get("flow", s.get("count", 0)) or 0
+                found = True
+        else:
+            val = entry.get("flow", entry.get("count"))
+            if val is not None:
+                total += val
+                found = True
+    return total if found else None
+
+
+def fetch_station(station_id: int) -> tuple[float | None, str | None]:
+    """Gibt (aktueller_wert, fehlermeldung) zurück — genau eines von beidem ist None."""
+    url = f"{BASE_URL}/VDP/{uid_for(station_id)}?sampleOnly=true"
+    request = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(request, timeout=15) as resp:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
-        sys.exit(
-            f"FEHLER: VDP-ZH antwortete mit HTTP {e.code} ({e.reason}).\n"
-            f"Antwortausschnitt: {body}"
-        )
+        return None, f"HTTP {e.code}"
     except urllib.error.URLError as e:
-        sys.exit(f"FEHLER: Verbindung zu VDP-ZH fehlgeschlagen: {e.reason}")
+        return None, f"Verbindung fehlgeschlagen ({e.reason})"
 
     try:
-        data = json.loads(raw)
+        payload = json.loads(raw)
     except json.JSONDecodeError:
-        preview = raw[:500].decode("utf-8", errors="replace")
-        sys.exit(
-            "FEHLER: Antwort von VDP-ZH war kein gültiges JSON (vermutlich eine "
-            f"HTML-Fehlerseite). Antwortausschnitt: {preview}"
-        )
+        return None, "Antwort war kein gültiges JSON"
 
-    # Je nach echter Response-Form anpassen: manche APIs verpacken die
-    # Liste in {"items": [...]} statt sie direkt zurückzugeben.
-    entries = data if isinstance(data, list) else data.get("items", data.get("data", []))
-    if not entries:
-        print("WARNUNG: VDP-ZH hat eine leere Liste zurückgegeben — nichts zu verknüpfen.")
-    return entries
-
-
-def sum_flow(entry: dict) -> float | None:
-    """
-    Ein AggVdp-Eintrag hat pro Fahrzeugklasse eine eigene Statistik
-    (AggVdpDetail mit u.a. 'flow'). Wir summieren über alle Klassen zu
-    einem Gesamtwert für die Messstelle.
-    """
-    stats = entry.get("statistics") or entry.get("details") or []
-    if not stats:
-        return entry.get("flow") or entry.get("count")
-    return sum(s.get("flow", s.get("count", 0)) for s in stats)
-
-
-def join(stations_by_id: dict[int, dict], aggregation_entries: list[dict]) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
-    matched, unmatched = 0, 0
-    result = {"fetched_at": now, "stations": {}}
-
-    for entry in aggregation_entries:
-        uid = entry.get("uniqueId") or entry.get("uID") or entry.get("id")
-        numeric_id = extract_numeric_id(uid)
-
-        if numeric_id is None or numeric_id not in stations_by_id:
-            unmatched += 1
-            continue
-
-        flow = sum_flow(entry)
-        if flow is None:
-            continue
-
-        result["stations"][str(numeric_id)] = {
-            "current": flow,
-            "intBegin": entry.get("intBegin"),
-        }
-        matched += 1
-
-    print(f"Verknüpft: {matched} Messstellen, nicht zugeordnet: {unmatched}")
-    if matched == 0 and aggregation_entries:
-        print(
-            "WARNUNG: Keine einzige Messstelle konnte zugeordnet werden — "
-            "vermutlich stimmt das angenommene uID-Format nicht. "
-            f"Beispiel-uID aus der Antwort: {aggregation_entries[0].get('uniqueId') or aggregation_entries[0].get('uID')}"
-        )
-    return result
+    flow = sum_flow(payload)
+    if flow is None:
+        return None, "keine verwertbaren Verkehrsdaten in der Antwort"
+    return flow, None
 
 
 def main():
-    stations_by_id = load_stations()
-    aggregation_entries = fetch_aggregation_data()
-    result = join(stations_by_id, aggregation_entries)
+    stations = load_stations()
+    now = datetime.now(timezone.utc).isoformat()
+    result = {"fetched_at": now, "stations": {}}
+
+    ok, failed = 0, 0
+    error_samples = []
+
+    for station in stations:
+        station_id = station["id"]
+        flow, error = fetch_station(station_id)
+
+        if error is not None:
+            failed += 1
+            if len(error_samples) < 5:
+                error_samples.append(f"M0{station_id}: {error}")
+            time.sleep(REQUEST_DELAY_SECONDS)
+            continue
+
+        result["stations"][str(station_id)] = {
+            "current": flow,
+            "fetched_at": now,
+        }
+        ok += 1
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    print(f"Abgefragt: {ok} erfolgreich, {failed} fehlgeschlagen (von {len(stations)} Messstellen).")
+    if error_samples:
+        print("Beispiele für Fehler:")
+        for line in error_samples:
+            print(f"  - {line}")
+
+    if ok == 0:
+        sys.exit(
+            "FEHLER: Keine einzige Messstelle konnte erfolgreich abgefragt werden. "
+            "Läuft die API gerade nicht, oder hat sich das URL-Format nochmal geändert?"
+        )
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
