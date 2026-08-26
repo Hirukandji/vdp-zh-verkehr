@@ -2,11 +2,11 @@ name: Update traffic data
 
 on:
   schedule:
-    # UTC-Zeit, aber da 15 Minuten glatt in 60 aufgehen und Zürich immer auf
-    # volle Stunden versetzt ist (UTC+1/UTC+2), landet das trotzdem exakt auf
-    # :00/:15/:30/:45 Lokalzeit. GitHub garantiert die Startzeit nicht auf die
-    # Minute genau — bei hoher Last kann ein Lauf ein paar Minuten später starten.
-    - cron: "*/15 * * * *"
+    # Stündlicher Basis-Abruf ALLER 358 Messstellen (nicht mehr alle 15 Min) —
+    # das hält die Anzahl Requests an VDP-ZH niedrig. Echtzeitwerte für eine
+    # einzelne, gerade angeklickte Messstelle holt sich das Frontend direkt
+    # und nur bei Bedarf, siehe fetchLiveForStation() in index.html.
+    - cron: "0 * * * *"
   workflow_dispatch: {} # erlaubt manuelles Auslösen über die GitHub-UI
 
 permissions:
@@ -19,7 +19,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10 # 358 Einzel-Requests nacheinander brauchen ein paar Minuten
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: VDP-ZH abfragen, per uID mit Geodaten verknüpfen
+      - name: VDP-ZH abfragen (alle Messstellen), Ergebnis speichern
         run: python join_traffic_data.py
 
       - name: latest.json committen, falls sich etwas geändert hat
