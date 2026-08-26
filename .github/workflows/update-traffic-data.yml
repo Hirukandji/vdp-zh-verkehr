@@ -1,0 +1,41 @@
+name: Update traffic data
+
+on:
+  schedule:
+    # UTC-Zeit, aber da 15 Minuten glatt in 60 aufgehen und Zürich immer auf
+    # volle Stunden versetzt ist (UTC+1/UTC+2), landet das trotzdem exakt auf
+    # :00/:15/:30/:45 Lokalzeit. GitHub garantiert die Startzeit nicht auf die
+    # Minute genau — bei hoher Last kann ein Lauf ein paar Minuten später starten.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {} # erlaubt manuelles Auslösen über die GitHub-UI
+
+permissions:
+  contents: write # nötig, damit der Job latest.json zurück ins Repo committen darf
+
+concurrency:
+  group: update-traffic-data
+  cancel-in-progress: false # laufenden Commit nicht abbrechen, nächsten Lauf lieber überspringen
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: VDP-ZH abfragen, per uID mit Geodaten verknüpfen
+        run: python join_traffic_data.py
+
+      - name: latest.json committen, falls sich etwas geändert hat
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add latest.json
+          git diff --staged --quiet || git commit -m "Verkehrsdaten aktualisiert $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
