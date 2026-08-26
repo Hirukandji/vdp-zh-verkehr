@@ -269,7 +269,7 @@
   </div>
   <div class="meta" id="statusMeta">
     <span class="dot demo"></span>Lade Daten …<br>
-    Takt: 15&nbsp;Min
+    Basis-Takt: stündlich
   </div>
 </header>
 
@@ -330,22 +330,21 @@
 /* ============================================================
    VDP-ZH Prototyp — Karte + 15-Min-Verkehrsdaten
    ------------------------------------------------------------
-   Diese Datei versucht ECHTE Aufrufe gegen die öffentliche API
-   (https://vdp.zh.ch/pws/public-service). Da weder die genauen
-   Feldnamen der Response noch das CORS-Verhalten der Ziel-API
-   bekannt sind, springt der Code bei Fehlschlag automatisch in
-   einen DEMO-Modus mit plausiblen Simulationsdaten, damit das
-   Konzept trotzdem sichtbar bleibt.
+   Zwei getrennte Datenquellen, um VDP-ZH nicht zu bombardieren:
 
-   Anpassung an die echte API:
-   - BASE_URL / ENDPOINTS unten prüfen (Swagger: vdp.zh.ch/openapi)
-   - parseStationList() und parseVolumeReading() an die echten
-     JSON-Feldnamen anpassen
+   1) STÜNDLICHE BASIS-DATEN für alle 358 Marker (Farbe/Pfeil/Tooltip):
+      kommen aus der eigenen latest.json, die ein GitHub-Actions-Job
+      einmal pro Stunde schreibt (siehe join_traffic_data.py). Das
+      Frontend ruft dafür NIE direkt vdp.zh.ch auf.
+
+   2) ECHTZEIT-EINZELWERT bei Klick auf eine Messstelle: genau EIN
+      Request direkt an vdp.zh.ch für nur diese eine uID
+      (/readOnlineAggregationData/VDP/M0{id}?sampleOnly=true, bestätigt
+      per Swagger-UI). Läuft nur, wenn wirklich geklickt wird.
    ============================================================ */
 
-const BASE_URL = "https://vdp.zh.ch/pws/public-service";
-const ENDPOINT_REALTIME = BASE_URL + "/readOnlineVbvData";
-const ENDPOINT_AGGREGATED = BASE_URL + "/readOnlineAggregationData";
+const BASE_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData";
+const HOURLY_SNAPSHOT_URL = "./latest.json"; // vom stündlichen GitHub-Actions-Job geschrieben
 
 let DEMO_MODE = false;
 let selectedMarker = null;
@@ -396,44 +395,64 @@ function showNetworkNotice() {
 function setStatus(mode) {
   const el = document.getElementById('statusMeta');
   if (mode === 'live') {
-    el.innerHTML = '<span class="dot live"></span>Live-Werte (VDP-ZH) · ' + STATIONS.length + ' Messstellen<br>Takt: 15 Min';
+    el.innerHTML = '<span class="dot live"></span>Basis: ' + STATIONS.length + ' Messstellen (stündlich) · Klick = Live-Wert';
   } else {
-    el.innerHTML = '<span class="dot demo"></span>Positionen echt · Verkehrswerte simuliert<br>Takt: 15 Min · ' + STATIONS.length + ' Messstellen';
+    el.innerHTML = '<span class="dot demo"></span>Basis simuliert (latest.json fehlt) · Klick versucht Live-Wert';
   }
 }
 
 // ------------------------------------------------------------
-// Live-Verkehrswerte laden und über die uID mit den echten
-// Geodaten (STATIONS_BY_ID) verknüpfen. Liefert eine Map
-// id -> { current, updatedAt } oder null bei Fehlschlag.
-// Query-Parameter des Endpoints (Filter nach Intervall etc.)
-// sind aus dem Swagger-Schema nicht ersichtlich -> ungefilterter
-// Aufruf; ggf. anpassen, sobald die genauen Parameter bekannt sind.
+// Stündliche Basis-Daten für ALLE Marker aus der eigenen latest.json
+// laden (vom GitHub-Actions-Job geschrieben). Kein direkter Aufruf
+// von vdp.zh.ch hier — das passiert nur noch pro Klick, siehe unten.
 // ------------------------------------------------------------
 async function tryLoadLiveValues() {
   try {
-    const res = await fetch(ENDPOINT_AGGREGATED, { method: 'GET' });
+    const res = await fetch(HOURLY_SNAPSHOT_URL, { method: 'GET' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-    const list = Array.isArray(data) ? data : (data.items || data.data || []);
-    if (!list.length) throw new Error('Leere Antwort');
-
+    const stationsObj = data.stations || {};
     const values = new Map();
-    for (const entry of list) {
-      const numId = extractNumericId(entry.uniqueId ?? entry.uID ?? entry.id);
-      if (numId == null || !STATIONS_BY_ID.has(numId)) continue;
-      // AggVdpDetail-Statistiken je Fahrzeugklasse aufsummieren -> Gesamtfluss
-      const stats = entry.statistics || entry.details || [];
-      const totalFlow = Array.isArray(stats)
-        ? stats.reduce((sum, s) => sum + (s.flow ?? s.count ?? 0), 0)
-        : (entry.flow ?? entry.count ?? null);
-      if (totalFlow == null) continue;
-      values.set(numId, { current: totalFlow, intBegin: entry.intBegin });
+    for (const [idStr, entry] of Object.entries(stationsObj)) {
+      const numId = parseInt(idStr, 10);
+      if (Number.isNaN(numId) || entry?.current == null) continue;
+      values.set(numId, { current: entry.current, fetchedAt: data.fetched_at });
     }
     return values.size ? values : null;
   } catch (err) {
-    console.warn('Live-API nicht nutzbar, verwende simulierte Werte:', err.message);
+    console.warn('latest.json nicht verfügbar, verwende simulierte Werte:', err.message);
     showNetworkNotice();
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
+// Echtzeit-Einzelwert für GENAU EINE Messstelle — läuft nur beim
+// Anklicken eines Markers, nicht automatisch für alle 358.
+// Bestätigter URL-Aufbau aus der Swagger-UI:
+// /readOnlineAggregationData/VDP/M0{id}?sampleOnly=true
+// ------------------------------------------------------------
+async function fetchLiveForStation(station) {
+  try {
+    const url = `${BASE_URL}/VDP/M0${station.id}?sampleOnly=true`;
+    const res = await fetch(url, { method: 'GET' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const entries = Array.isArray(data) ? data : [data];
+    let total = 0, found = false;
+    for (const entry of entries) {
+      const stats = entry?.statistics || entry?.details || [];
+      if (stats.length) {
+        for (const s of stats) { total += (s.flow ?? s.count ?? 0); found = true; }
+      } else if (entry?.flow != null || entry?.count != null) {
+        total += (entry.flow ?? entry.count); found = true;
+      }
+    }
+    return found ? total : null;
+  } catch (err) {
+    console.warn('Live-Einzelabfrage fehlgeschlagen für', station.id, err.message);
+    // Bewusst kein showNetworkNotice() hier — ein einzelner fehlgeschlagener
+    // Klick-Request ist kein grundsätzliches Netzwerkproblem wie beim Bulk-Fall.
     return null;
   }
 }
@@ -472,10 +491,18 @@ function fmtTime(d) {
 // ------------------------------------------------------------
 const STATION_SNAPSHOTS = new Map();
 
+// Grobe 15-Minuten-Spitzenkapazität aus dem Speed-Limit abgeleitet — dient
+// als stabile Referenz für die Auslastungsfarbe, unabhängig davon, ob der
+// Wert aus der stündlichen Basis oder einer Live-Einzelabfrage stammt.
+function fifteenMinCapacity(station) {
+  const baseline = station.speedLimit >= 100 ? 900 : station.speedLimit >= 80 ? 650 : 420;
+  return (baseline / 4) * 1.55;
+}
+
 function computeSnapshot(station) {
   const live = LIVE_VALUES?.get(station.id);
   // Baseline/Kapazität grob aus Speed-Limit abgeleitet (keine historischen
-  // Werte verfügbar) bzw. aus einem echten Live-Wert kalibriert.
+  // Werte verfügbar) bzw. aus einem echten Wert aus der Stunden-Datei kalibriert.
   const baseline = live?.current
     ? live.current * 4
     : (station.speedLimit >= 100 ? 900 : station.speedLimit >= 80 ? 650 : 420);
@@ -645,6 +672,22 @@ async function selectStation(station, marker) {
       document.getElementById('pStationName').textContent = street || `Messstelle ${station.id}`;
     }
   }
+
+  // Echtzeit-Einzelwert nachladen — genau EIN Request, nur für diese
+  // eine Messstelle, ausgelöst durch den Klick.
+  const liveValue = await fetchLiveForStation(station);
+  if (myToken === selectionToken && liveValue != null) {
+    document.getElementById('pStatCurrent').textContent = liveValue.toLocaleString('de-CH');
+    document.getElementById('pUpdated').textContent = 'aktualisiert gerade eben (Live)';
+    document.getElementById('pSource').innerHTML =
+      'Quelle: VDP-ZH (Live-Einzelabfrage)' +
+      ` · <a href="${station.gis}" target="_blank" rel="noopener" style="color:inherit">GIS-Browser ↗</a>`;
+
+    const cap = fifteenMinCapacity(station);
+    const updatedSnap = { ...snap, current: liveValue, loadRatio: Math.max(0, Math.min(1, liveValue / cap)) };
+    STATION_SNAPSHOTS.set(station.id, updatedSnap);
+    updateMarkerVisual(station); // nur DIESER eine Marker wird eingefärbt aktualisiert
+  }
 }
 
 function drawChart(series) {
@@ -712,8 +755,10 @@ async function init() {
 
 init();
 
-// Live-Refresh alle 15 Minuten: Werte + Snapshots neu berechnen, alle Marker
-// (Farbe/Pfeil/Tooltip) aktualisieren, offenes Panel neu befüllen.
+// Basis-Refresh stündlich (passend zum GitHub-Actions-Takt): Werte aus
+// latest.json + Snapshots neu berechnen, alle Marker (Farbe/Pfeil/Tooltip)
+// aktualisieren. Der Echtzeit-Einzelwert einer offenen Messstelle wird
+// zusätzlich frisch nachgeladen (fetchLiveForStation in selectStation).
 setInterval(async () => {
   LIVE_VALUES = await tryLoadLiveValues();
   DEMO_MODE = !LIVE_VALUES;
@@ -727,7 +772,7 @@ setInterval(async () => {
     const st = STATIONS_BY_ID.get(id);
     if (st) selectStation(st, st._marker);
   }
-}, 15 * 60 * 1000);
+}, 60 * 60 * 1000);
 </script>
 
 </body>
