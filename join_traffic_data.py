@@ -1,5 +1,8 @@
 """
-Wird alle 15 Minuten von GitHub Actions ausgeführt.
+Wird stündlich von GitHub Actions ausgeführt (Basis-Daten für alle
+358 Messstellen). Echtzeitwerte für eine einzelne, angeklickte
+Messstelle holt sich das Frontend separat und nur bei Bedarf direkt
+von VDP-ZH — dieses Skript ist dafür nicht zuständig.
 Fragt für jede der 358 Messstellen einzeln die aktuelle Verkehrsmenge bei
 VDP-ZH ab (ein Request pro Messstelle, wie es die API laut Swagger-UI
 verlangt: /readOnlineAggregationData/VDP/{uid}?sampleOnly=true) und
@@ -18,7 +21,7 @@ BASE_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData"
 STATIONS_FILE = "stations.json"   # deine 358 Messstellen, id = MESSST_NR
 OUTPUT_FILE = "latest.json"
 REQUEST_DELAY_SECONDS = 0.15      # kleine Pause zwischen Requests, aus Fairness gegenüber dem Server
-REQUEST_TIMEOUT_SECONDS = 10
+REQUEST_TIMEOUT_SECONDS = 15
 
 HEADERS = {
     # Möglichst wie ein echter Browser-Request wirken, da manche Server/
@@ -82,8 +85,11 @@ def fetch_station(station_id: int) -> tuple[float | None, str | None]:
             raw = resp.read()
     except urllib.error.HTTPError as e:
         return None, f"HTTP {e.code}"
-    except urllib.error.URLError as e:
-        return None, f"Verbindung fehlgeschlagen ({e.reason})"
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        # TimeoutError/OSError fängt auch rohe Socket-/SSL-Timeouts ab, die
+        # urllib nicht immer sauber in URLError verpackt — sonst stürzt das
+        # ganze Skript bei einem einzigen langsamen Server-Antwortversuch ab.
+        return None, f"Verbindung fehlgeschlagen ({e})"
 
     try:
         payload = json.loads(raw)
@@ -106,7 +112,10 @@ def main():
 
     for station in stations:
         station_id = station["id"]
-        flow, error = fetch_station(station_id)
+        try:
+            flow, error = fetch_station(station_id)
+        except Exception as e:  # Sicherheitsnetz: kein einzelner Ausreisser darf den ganzen Lauf stoppen
+            flow, error = None, f"unerwarteter Fehler ({e})"
 
         if error is not None:
             failed += 1
