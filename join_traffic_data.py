@@ -21,8 +21,15 @@ REQUEST_DELAY_SECONDS = 0.15      # kleine Pause zwischen Requests, aus Fairness
 REQUEST_TIMEOUT_SECONDS = 10
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; vdp-zh-sync/1.0)",
-    "Accept": "application/json",
+    # Möglichst wie ein echter Browser-Request wirken, da manche Server/
+    # Sicherheitsschichten unbekannte User-Agents oder zu strikte Accept-
+    # Header mit 406 Not Acceptable ablehnen.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
 }
 
 
