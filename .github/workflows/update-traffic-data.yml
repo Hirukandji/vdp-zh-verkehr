@@ -1,152 +1,41 @@
-"""
-Wird stündlich von GitHub Actions ausgeführt (Basis-Daten für alle
-358 Messstellen). Echtzeitwerte für eine einzelne, angeklickte
-Messstelle holt sich das Frontend separat und nur bei Bedarf direkt
-von VDP-ZH — dieses Skript ist dafür nicht zuständig.
-Fragt für jede der 358 Messstellen einzeln die aktuelle Verkehrsmenge bei
-VDP-ZH ab (ein Request pro Messstelle, wie es die API laut Swagger-UI
-verlangt: /readOnlineAggregationData/VDP/{uid}?sampleOnly=true) und
-schreibt das Ergebnis als latest.json, die das Frontend danach lädt.
-"""
+name: Update traffic data
 
-import json
-import os
-import sys
-import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
+on:
+  schedule:
+    # Stündlicher Basis-Abruf ALLER 358 Messstellen (nicht mehr alle 15 Min) —
+    # das hält die Anzahl Requests an VDP-ZH niedrig. Echtzeitwerte für eine
+    # einzelne, gerade angeklickte Messstelle holt sich das Frontend direkt
+    # und nur bei Bedarf, siehe fetchLiveForStation() in index.html.
+    - cron: "0 * * * *"
+  workflow_dispatch: {} # erlaubt manuelles Auslösen über die GitHub-UI
 
-BASE_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData"
-STATIONS_FILE = "stations.json"   # deine 358 Messstellen, id = MESSST_NR
-OUTPUT_FILE = "latest.json"
-REQUEST_DELAY_SECONDS = 0.15      # kleine Pause zwischen Requests, aus Fairness gegenüber dem Server
-REQUEST_TIMEOUT_SECONDS = 15
+permissions:
+  contents: write # nötig, damit der Job latest.json zurück ins Repo committen darf
 
-HEADERS = {
-    # Möglichst wie ein echter Browser-Request wirken, da manche Server/
-    # Sicherheitsschichten unbekannte User-Agents oder zu strikte Accept-
-    # Header mit 406 Not Acceptable ablehnen.
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
-}
+concurrency:
+  group: update-traffic-data
+  cancel-in-progress: false # laufenden Commit nicht abbrechen, nächsten Lauf lieber überspringen
 
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # 358 Einzel-Requests nacheinander brauchen ein paar Minuten
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
 
-def uid_for(station_id: int) -> str:
-    # Bestätigtes Format aus der Swagger-UI: "M0" + Messstellen-Nummer, z.B. M0197
-    return f"M0{station_id}"
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
+      - name: VDP-ZH abfragen (alle Messstellen), Ergebnis speichern
+        run: python join_traffic_data.py
 
-def load_stations() -> list[dict]:
-    if not os.path.isfile(STATIONS_FILE):
-        sys.exit(
-            f"FEHLER: '{STATIONS_FILE}' wurde im Repository nicht gefunden. "
-            "Liegt die Datei im Hauptordner (gleiche Ebene wie dieses Skript)?"
-        )
-    with open(STATIONS_FILE, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def sum_flow(payload) -> float | None:
-    """
-    Eine Antwort kann ein einzelnes AggVdp-Objekt oder eine Liste davon sein.
-    Innerhalb hat jede Fahrzeugklasse ihre eigene Statistik (AggVdpDetail mit
-    u.a. 'flow') — wir summieren über alle Klassen zu einem Gesamtwert.
-    """
-    entries = payload if isinstance(payload, list) else [payload]
-    total = 0.0
-    found = False
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        stats = entry.get("statistics") or entry.get("details") or []
-        if stats:
-            for s in stats:
-                total += s.get("flow", s.get("count", 0)) or 0
-                found = True
-        else:
-            val = entry.get("flow", entry.get("count"))
-            if val is not None:
-                total += val
-                found = True
-    return total if found else None
-
-
-def fetch_station(station_id: int) -> tuple[float | None, str | None]:
-    """Gibt (aktueller_wert, fehlermeldung) zurück — genau eines von beidem ist None."""
-    url = f"{BASE_URL}/VDP/{uid_for(station_id)}?sampleOnly=true"
-    request = urllib.request.Request(url, headers=HEADERS)
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as e:
-        return None, f"HTTP {e.code}"
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        # TimeoutError/OSError fängt auch rohe Socket-/SSL-Timeouts ab, die
-        # urllib nicht immer sauber in URLError verpackt — sonst stürzt das
-        # ganze Skript bei einem einzigen langsamen Server-Antwortversuch ab.
-        return None, f"Verbindung fehlgeschlagen ({e})"
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return None, "Antwort war kein gültiges JSON"
-
-    flow = sum_flow(payload)
-    if flow is None:
-        return None, "keine verwertbaren Verkehrsdaten in der Antwort"
-    return flow, None
-
-
-def main():
-    stations = load_stations()
-    now = datetime.now(timezone.utc).isoformat()
-    result = {"fetched_at": now, "stations": {}}
-
-    ok, failed = 0, 0
-    error_samples = []
-
-    for station in stations:
-        station_id = station["id"]
-        try:
-            flow, error = fetch_station(station_id)
-        except Exception as e:  # Sicherheitsnetz: kein einzelner Ausreisser darf den ganzen Lauf stoppen
-            flow, error = None, f"unerwarteter Fehler ({e})"
-
-        if error is not None:
-            failed += 1
-            if len(error_samples) < 5:
-                error_samples.append(f"M0{station_id}: {error}")
-            time.sleep(REQUEST_DELAY_SECONDS)
-            continue
-
-        result["stations"][str(station_id)] = {
-            "current": flow,
-            "fetched_at": now,
-        }
-        ok += 1
-        time.sleep(REQUEST_DELAY_SECONDS)
-
-    print(f"Abgefragt: {ok} erfolgreich, {failed} fehlgeschlagen (von {len(stations)} Messstellen).")
-    if error_samples:
-        print("Beispiele für Fehler:")
-        for line in error_samples:
-            print(f"  - {line}")
-
-    if ok == 0:
-        sys.exit(
-            "FEHLER: Keine einzige Messstelle konnte erfolgreich abgefragt werden. "
-            "Läuft die API gerade nicht, oder hat sich das URL-Format nochmal geändert?"
-        )
-
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"'{OUTPUT_FILE}' geschrieben.")
-
-
-if __name__ == "__main__":
-    main()
+      - name: latest.json committen, falls sich etwas geändert hat
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add latest.json
+          git diff --staged --quiet || git commit -m "Verkehrsdaten aktualisiert $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
