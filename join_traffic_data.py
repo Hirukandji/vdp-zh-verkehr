@@ -42,8 +42,10 @@ HEADERS = {
 
 
 def uid_for(station_id: int) -> str:
-    # Bestätigtes Format aus der Swagger-UI: "M0" + Messstellen-Nummer, z.B. M0197
-    return f"M0{station_id}"
+    # Bestätigte Regel: uID ist immer "M" + 4-stellige, mit führenden Nullen
+    # aufgefüllte Messstellen-Nummer. Z.B. 88 -> M0088, 197 -> M0197,
+    # 5091 -> M5091 (schon 4-stellig, keine zusätzliche Null nötig).
+    return f"M{station_id:04d}"
 
 
 def load_stations() -> list[dict]:
@@ -132,7 +134,7 @@ def main():
             if error is not None:
                 failed += 1
                 if len(error_samples) < 5:
-                    error_samples.append(f"M0{station_id}: {error}")
+                    error_samples.append(f"{uid_for(station_id)}: {error}")
                 continue
 
             result["stations"][str(station_id)] = {
