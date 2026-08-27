@@ -1,21 +1,16 @@
 """
-Wird stündlich von GitHub Actions ausgeführt (Basis-Daten für alle
-329 aktiven Messstellen — von ursprünglich 358 aus der Excel-Liste
-sind 24 laut echtem Collector-Status DISABLED/IMPORTED und damit
-nicht über die Echtzeit-API abfragbar; 5 weitere waren nicht in der
-Collector-Liste auffindbar. Diese wurden vorab herausgefiltert).
-Echtzeitwerte für eine einzelne, angeklickte Messstelle holt sich
-das Frontend separat und nur bei Bedarf direkt von VDP-ZH — dieses
-Skript ist dafür nicht zuständig.
+Wird EINMAL PRO TAG von GitHub Actions ausgeführt (nicht mehr stündlich —
+das hat den Server mit 329 Anfragen/Stunde überlastet, siehe frühere
+Läufe mit Massen-Timeouts). Holt für jede aktive Messstelle einen
+aktuellen Wert und hängt ihn an eine selbst geführte Historie in
+history.json an (rollierendes Fenster der letzten HISTORY_DAYS Tage).
 
-Fragt für jede aktive Messstelle einzeln die aktuelle Verkehrsmenge bei
-VDP-ZH ab (ein Request pro Messstelle, wie es die API laut Swagger-UI
-verlangt: /readOnlineAggregationData/VDP/{uid}?sampleOnly=true) und
-schreibt das Ergebnis als latest.json, die das Frontend danach lädt.
+Damit brauchen wir keine (unbestätigte) Historien-Funktion der VDP-ZH-
+API selbst -- wir bauen die Tages-Historie einfach über die Zeit aus
+unseren eigenen täglichen Schnappschüssen auf.
 
-Die Requests laufen PARALLEL (Thread-Pool), nicht nacheinander —
-sequenziell mit Timeout würde bei ein paar langsamen Antworten leicht
-das 10-Minuten-Zeitlimit von GitHub Actions sprengen.
+Echtzeitwerte für eine einzelne, angeklickte Messstelle holt sich das
+Frontend weiterhin separat und nur bei Bedarf direkt von VDP-ZH.
 """
 
 import json
@@ -28,16 +23,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 BASE_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData"
-STATIONS_FILE = "stations.json"   # deine 329 aktive Messstellen, id = MESSST_NR
-OUTPUT_FILE = "latest.json"
-REQUEST_TIMEOUT_SECONDS = 8       # eher kurz halten, damit einzelne Hänger nicht das Zeitbudget sprengen
-MAX_PARALLEL_REQUESTS = 10        # etwas zurückhaltender als zuvor (20), um den Server nicht zu überlasten
-CONNECTION_RETRY_COUNT = 2        # bei reinen Verbindungs-/Timeout-Fehlern (nicht bei HTTP-Fehlercodes) erneut versuchen
+STATIONS_FILE = "stations.json"   # 329 aktive Messstellen, id = MESSST_NR
+HISTORY_FILE = "history.json"     # rollierende Tages-Historie, wird von diesem Skript gepflegt
+HISTORY_DAYS = 5                  # wie viele Tage pro Messstelle aufgehoben werden
+
+REQUEST_TIMEOUT_SECONDS = 15
+MAX_PARALLEL_REQUESTS = 4         # zurückhaltend -- höhere Werte führten zu Massen-Timeouts
+CONNECTION_RETRY_COUNT = 1        # kein Retry -- hat die Erfolgsquote in Tests nicht verbessert
 
 HEADERS = {
-    # Möglichst wie ein echter Browser-Request wirken, da manche Server/
-    # Sicherheitsschichten unbekannte User-Agents oder zu strikte Accept-
-    # Header mit 406 Not Acceptable ablehnen.
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
@@ -48,9 +42,6 @@ HEADERS = {
 
 
 def uid_for(station_id: int) -> str:
-    # Bestätigte Regel: uID ist immer "M" + 4-stellige, mit führenden Nullen
-    # aufgefüllte Messstellen-Nummer. Z.B. 88 -> M0088, 197 -> M0197,
-    # 5091 -> M5091 (schon 4-stellig, keine zusätzliche Null nötig).
     return f"M{station_id:04d}"
 
 
@@ -64,12 +55,18 @@ def load_stations() -> list[dict]:
         return json.load(f)
 
 
+def load_history() -> dict:
+    if not os.path.isfile(HISTORY_FILE):
+        return {}
+    with open(HISTORY_FILE, encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            print(f"WARNUNG: '{HISTORY_FILE}' war beschädigt, starte neue Historie.")
+            return {}
+
+
 def sum_flow(payload) -> float | None:
-    """
-    Eine Antwort kann ein einzelnes AggVdp-Objekt oder eine Liste davon sein.
-    Innerhalb hat jede Fahrzeugklasse ihre eigene Statistik (AggVdpDetail mit
-    u.a. 'flow') — wir summieren über alle Klassen zu einem Gesamtwert.
-    """
     entries = payload if isinstance(payload, list) else [payload]
     total = 0.0
     found = False
@@ -90,10 +87,6 @@ def sum_flow(payload) -> float | None:
 
 
 def fetch_station(station_id: int) -> tuple[float | None, str | None]:
-    """Gibt (aktueller_wert, fehlermeldung) zurück — genau eines von beidem ist None.
-    Bei reinen Verbindungs-/Timeout-Fehlern (nicht bei HTTP-Fehlercodes wie 404,
-    die eine echte Antwort des Servers sind) wird kurz erneut versucht — das
-    unterscheidet einen kurzen Netzwerk-Ausrutscher von einem echten Ausfall."""
     url = f"{BASE_URL}/VDP/{uid_for(station_id)}?sampleOnly=true"
     request = urllib.request.Request(url, headers=HEADERS)
 
@@ -102,9 +95,9 @@ def fetch_station(station_id: int) -> tuple[float | None, str | None]:
         try:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
                 raw = resp.read()
-            break  # Erfolg -> Retry-Schleife verlassen
+            break
         except urllib.error.HTTPError as e:
-            return None, f"HTTP {e.code}"  # echte Serverantwort, kein Verbindungsproblem -> kein Retry
+            return None, f"HTTP {e.code}"
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_conn_error = e
             if attempt < CONNECTION_RETRY_COUNT - 1:
@@ -125,8 +118,6 @@ def fetch_station(station_id: int) -> tuple[float | None, str | None]:
 
 
 def fetch_station_safe(station_id: int) -> tuple[int, float | None, str | None]:
-    """Wrapper fürs Thread-Pool: fängt auch unerwartete Fehler ab, damit ein
-    einzelner Ausreisser nicht den ganzen Lauf gefährdet."""
     try:
         flow, error = fetch_station(station_id)
     except Exception as e:
@@ -134,16 +125,29 @@ def fetch_station_safe(station_id: int) -> tuple[int, float | None, str | None]:
     return station_id, flow, error
 
 
+def append_to_history(history: dict, station_id: str, today: str, value: float) -> None:
+    entries = history.setdefault(station_id, [])
+    # Falls heute schon ein Eintrag existiert (z.B. Skript zweimal am selben Tag
+    # manuell ausgelöst) -> überschreiben statt duplizieren.
+    entries[:] = [e for e in entries if e.get("date") != today]
+    entries.append({"date": today, "value": value})
+    entries.sort(key=lambda e: e["date"])
+    del entries[:-HISTORY_DAYS]  # nur die letzten HISTORY_DAYS Einträge behalten
+
+
 def main():
     stations = load_stations()
-    now = datetime.now(timezone.utc).isoformat()
-    result = {"fetched_at": now, "stations": {}}
+    history = load_history()
+    today = datetime.now(timezone.utc).date().isoformat()
 
     ok, failed = 0, 0
     error_samples = []
 
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_REQUESTS) as pool:
-        futures = [pool.submit(fetch_station_safe, s["id"]) for s in stations]
+        futures = []
+        for s in stations:
+            futures.append(pool.submit(fetch_station_safe, s["id"]))
+            time.sleep(0.05)
         for future in as_completed(futures):
             station_id, flow, error = future.result()
 
@@ -153,10 +157,7 @@ def main():
                     error_samples.append(f"{uid_for(station_id)}: {error}")
                 continue
 
-            result["stations"][str(station_id)] = {
-                "current": flow,
-                "fetched_at": now,
-            }
+            append_to_history(history, str(station_id), today, flow)
             ok += 1
 
     print(f"Abgefragt: {ok} erfolgreich, {failed} fehlgeschlagen (von {len(stations)} Messstellen).")
@@ -171,9 +172,9 @@ def main():
             "Läuft die API gerade nicht, oder hat sich das URL-Format nochmal geändert?"
         )
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"'{OUTPUT_FILE}' geschrieben.")
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, separators=(",", ":"))
+    print(f"'{HISTORY_FILE}' aktualisiert ({today}, {ok} Messstellen).")
 
 
 if __name__ == "__main__":
