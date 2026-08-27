@@ -269,7 +269,7 @@
   </div>
   <div class="meta" id="statusMeta">
     <span class="dot demo"></span>Lade Daten …<br>
-    Basis-Takt: stündlich
+    Basis-Takt: täglich
   </div>
 </header>
 
@@ -303,19 +303,22 @@
       <div class="stat-row">
         <div class="stat">
           <div class="num" id="pStatCurrent">—</div>
-          <div class="lbl">Fahrzeuge / 15 Min<br>(aktuell)</div>
+          <div class="lbl">Fahrzeuge (letzter Tag)</div>
         </div>
         <div class="stat">
           <div class="num" id="pStatAvg">—</div>
-          <div class="lbl">Ø letzte 4 Std.</div>
+          <div class="lbl">Ø letzte 5 Tage</div>
         </div>
         <div class="stat">
           <div class="num" id="pStatTrend">—</div>
-          <div class="lbl">Trend vs. Vorwert</div>
+          <div class="lbl">Trend vs. Vortag</div>
         </div>
       </div>
+      <div id="pLiveRow" style="display:none; padding:10px 22px; border-bottom:1px solid var(--line); font-family:var(--mono); font-size:12px; background:#fbf6f0;">
+        <span style="color:var(--muted);">Live jetzt:</span> <span id="pLiveValue" style="font-weight:600;">—</span>
+      </div>
       <div class="chart-wrap">
-        <div class="chart-title">VERKEHRSMENGE — LETZTE 4 STUNDEN (15-MIN-INTERVALLE)</div>
+        <div class="chart-title">VERKEHRSMENGE — LETZTE 5 TAGE</div>
         <div class="chart-canvas-box"><canvas id="volChart"></canvas></div>
       </div>
       <div class="panel-foot">
@@ -344,7 +347,7 @@
    ============================================================ */
 
 const BASE_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData";
-const HOURLY_SNAPSHOT_URL = "./latest.json"; // vom stündlichen GitHub-Actions-Job geschrieben
+const HISTORY_URL = "./history.json"; // vom täglichen GitHub-Actions-Job geschrieben, letzte 5 Tage pro Messstelle
 
 let DEMO_MODE = false;
 let selectedMarker = null;
@@ -397,32 +400,33 @@ function showNetworkNotice() {
 function setStatus(mode) {
   const el = document.getElementById('statusMeta');
   if (mode === 'live') {
-    el.innerHTML = '<span class="dot live"></span>Basis: ' + STATIONS.length + ' Messstellen (stündlich) · Klick = Live-Wert';
+    el.innerHTML = '<span class="dot live"></span>Basis: ' + STATIONS.length + ' Messstellen (täglich) · Klick = Live-Wert';
   } else {
-    el.innerHTML = '<span class="dot demo"></span>Basis simuliert (latest.json fehlt) · Klick versucht Live-Wert';
+    el.innerHTML = '<span class="dot demo"></span>Basis simuliert (history.json fehlt) · Klick versucht Live-Wert';
   }
 }
 
 // ------------------------------------------------------------
-// Stündliche Basis-Daten für ALLE Marker aus der eigenen latest.json
-// laden (vom GitHub-Actions-Job geschrieben). Kein direkter Aufruf
-// von vdp.zh.ch hier — das passiert nur noch pro Klick, siehe unten.
+// Tages-Historie (letzte 5 Tage) für ALLE Marker aus der eigenen
+// history.json laden (vom täglichen GitHub-Actions-Job geschrieben).
+// Kein direkter Aufruf von vdp.zh.ch hier — das passiert nur noch
+// pro Klick, siehe fetchLiveForStation() unten.
+// Rückgabe: Map id -> [{date, value}, ...] (älteste zuerst).
 // ------------------------------------------------------------
-async function tryLoadLiveValues() {
+async function loadHistory() {
   try {
-    const res = await fetch(HOURLY_SNAPSHOT_URL, { method: 'GET' });
+    const res = await fetch(HISTORY_URL, { method: 'GET' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-    const stationsObj = data.stations || {};
-    const values = new Map();
-    for (const [idStr, entry] of Object.entries(stationsObj)) {
+    const history = new Map();
+    for (const [idStr, entries] of Object.entries(data)) {
       const numId = parseInt(idStr, 10);
-      if (Number.isNaN(numId) || entry?.current == null) continue;
-      values.set(numId, { current: entry.current, fetchedAt: data.fetched_at });
+      if (Number.isNaN(numId) || !Array.isArray(entries) || !entries.length) continue;
+      history.set(numId, entries);
     }
-    return values.size ? values : null;
+    return history.size ? history : null;
   } catch (err) {
-    console.warn('latest.json nicht verfügbar, verwende simulierte Werte:', err.message);
+    console.warn('history.json nicht verfügbar, verwende simulierte Werte:', err.message);
     showNetworkNotice();
     return null;
   }
@@ -486,35 +490,51 @@ function fmtTime(d) {
 }
 
 // ------------------------------------------------------------
-// Snapshot je Messstelle: aktueller 15-Min-Wert, Vorwert, Trend,
-// Auslastungsgrad (0..1) und die volle Zeitreihe (fürs Chart im
-// Panel — dieselben Daten wie die Markerfarbe, keine Doppel-
-// generierung mit abweichenden Zufallswerten).
+// Snapshot je Messstelle: letzter Tageswert, Vortageswert, Trend,
+// Auslastungsgrad (0..1) und die volle 5-Tage-Historie (für Hover-
+// Mini-Chart und Panel-Chart — dieselben Daten, keine Doppelgenerierung).
 // ------------------------------------------------------------
 const STATION_SNAPSHOTS = new Map();
 
-// Grobe 15-Minuten-Spitzenkapazität aus dem Speed-Limit abgeleitet — dient
-// als stabile Referenz für die Auslastungsfarbe, unabhängig davon, ob der
-// Wert aus der stündlichen Basis oder einer Live-Einzelabfrage stammt.
+// Grobe Tages-Spitzenkapazität aus dem Speed-Limit abgeleitet — dient als
+// stabile Referenz für die Auslastungsfarbe.
+function dailyCapacity(station) {
+  const baseline = station.speedLimit >= 100 ? 900 : station.speedLimit >= 80 ? 650 : 420;
+  return baseline * 16; // grobe Tageskapazität (Analogie zur früheren 15-Min-Logik)
+}
+// Für die Live-Einzelabfrage (ein 15-Min-Wert) brauchen wir weiterhin eine
+// 15-Min-Referenz, unabhängig von der Tages-Historie:
 function fifteenMinCapacity(station) {
   const baseline = station.speedLimit >= 100 ? 900 : station.speedLimit >= 80 ? 650 : 420;
   return (baseline / 4) * 1.55;
 }
 
 function computeSnapshot(station) {
-  const live = LIVE_VALUES?.get(station.id);
-  // Baseline/Kapazität grob aus Speed-Limit abgeleitet (keine historischen
-  // Werte verfügbar) bzw. aus einem echten Wert aus der Stunden-Datei kalibriert.
-  const baseline = live?.current
-    ? live.current * 4
-    : (station.speedLimit >= 100 ? 900 : station.speedLimit >= 80 ? 650 : 420);
-  const series = generateSeries(baseline);
-  const current = series[series.length - 1].value;
-  const prev = series[series.length - 2].value;
+  const hist = HISTORY?.get(station.id);
+  if (hist && hist.length) {
+    const current = hist[hist.length - 1].value;
+    const prev = hist.length > 1 ? hist[hist.length - 2].value : current;
+    const trend = current - prev;
+    const capacity = dailyCapacity(station);
+    const loadRatio = Math.max(0, Math.min(1, current / capacity));
+    return { history: hist, current, prev, trend, loadRatio, isReal: true };
+  }
+  // Kein echter Datenpunkt vorhanden (Demo-Fallback): plausible 5-Tage-
+  // Demoreihe simulieren, damit die Karte trotzdem etwas zeigt.
+  const baseline = station.speedLimit >= 100 ? 900 : station.speedLimit >= 80 ? 650 : 420;
+  const demo = [];
+  const today = new Date();
+  for (let i = 4; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400000);
+    const noise = 0.8 + Math.random() * 0.4;
+    demo.push({ date: d.toISOString().slice(0, 10), value: Math.round(baseline * 16 * noise / 16) });
+  }
+  const current = demo[demo.length - 1].value;
+  const prev = demo[demo.length - 2].value;
   const trend = current - prev;
-  const capacity = (baseline / 4) * 1.55; // grobe Spitzenkapazität zur Einordnung
+  const capacity = dailyCapacity(station);
   const loadRatio = Math.max(0, Math.min(1, current / capacity));
-  return { series, current, prev, trend, loadRatio, isLive: !!live };
+  return { history: demo, current, prev, trend, loadRatio, isReal: false };
 }
 
 function refreshAllSnapshots() {
@@ -529,7 +549,6 @@ function loadColor(ratio) {
 }
 
 // Pfeil-Konvention lt. Anforderung: ROT = steigender Trend, GRÜN = fallender Trend.
-// Bei sehr kleiner Änderung (< 3 Fahrzeuge) kein Pfeil (stabil).
 function trendArrowHtml(trend) {
   if (Math.abs(trend) < 3) return '';
   const up = trend > 0;
@@ -542,13 +561,32 @@ function markerIconHtml(station, snap) {
   return `<div class="vzs-marker" data-id="${station.id}" style="background:${loadColor(snap.loadRatio)}">${trendArrowHtml(snap.trend)}</div>`;
 }
 
+// Kleines eingebettetes SVG-Balkendiagramm (5 Tage) fürs Hover-Tooltip —
+// rein aus bereits geladenen Daten, kein zusätzlicher Netzwerk-Request.
+function miniHistoryChartSvg(history) {
+  const w = 130, h = 40, barGap = 3;
+  const barW = (w - barGap * (history.length - 1)) / history.length;
+  const max = Math.max(...history.map(e => e.value), 1);
+  const bars = history.map((e, i) => {
+    const barH = Math.max(2, (e.value / max) * (h - 4));
+    const x = i * (barW + barGap);
+    const y = h - barH;
+    const isLast = i === history.length - 1;
+    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" fill="${isLast ? '#c05a2c' : 'rgba(192,90,44,0.4)'}" rx="1"/>`;
+  }).join('');
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block;margin-top:4px;">${bars}</svg>`;
+}
+
 function markerTooltipHtml(station, snap) {
   const trendTxt = Math.abs(snap.trend) < 3
     ? 'stabil'
     : (snap.trend > 0 ? `+${snap.trend} steigend` : `${snap.trend} fallend`);
+  const dayLabels = snap.history.map(e => e.date.slice(5).replace('-', '.')).join(' · ');
   return `<b>Messstelle ${formatUid(station)}</b>` +
     `${station.speedLimit ? station.speedLimit + ' km/h-Zone · ' : ''}` +
-    `aktuell ${snap.current.toLocaleString('de-CH')} Fz. / 15 Min (${trendTxt})`;
+    `letzter Tageswert ${snap.current.toLocaleString('de-CH')} Fz. (${trendTxt})` +
+    miniHistoryChartSvg(snap.history) +
+    `<div style="font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:2px;">${dayLabels}</div>`;
 }
 
 // ------------------------------------------------------------
@@ -636,8 +674,8 @@ async function selectStation(station, marker) {
 
   const snap = STATION_SNAPSHOTS.get(station.id) || computeSnapshot(station);
   STATION_SNAPSHOTS.set(station.id, snap);
-  const { series, current, prev, trend, isLive: live } = snap;
-  const avg4h = Math.round(series.reduce((a, p) => a + p.value, 0) / series.length);
+  const { history, current, trend, isReal } = snap;
+  const avg5d = Math.round(history.reduce((a, p) => a + p.value, 0) / history.length);
   const trendArrow = Math.abs(trend) < 3 ? '' : (trend > 0 ? ' ▲' : ' ▼');
   const trendStr = (trend >= 0 ? '+' : '') + trend + trendArrow;
 
@@ -654,19 +692,20 @@ async function selectStation(station, marker) {
     station.lat.toFixed(5) + '° N, ' + station.lon.toFixed(5) + '° E';
 
   document.getElementById('pStatCurrent').textContent = current.toLocaleString('de-CH');
-  document.getElementById('pStatAvg').textContent = avg4h.toLocaleString('de-CH');
+  document.getElementById('pStatAvg').textContent = avg5d.toLocaleString('de-CH');
   document.getElementById('pStatTrend').textContent = trendStr;
   // Konvention: rot = steigend, grün = fallend (fest, unabhängig vom sonstigen Signalton)
   document.getElementById('pStatTrend').style.color =
     Math.abs(trend) < 3 ? 'var(--muted)' : (trend > 0 ? '#c0392b' : '#3d7a54');
 
   document.getElementById('pUpdated').textContent =
-    'aktualisiert ' + fmtTime(series[series.length - 1].time);
+    'letzter Tageswert: ' + history[history.length - 1].date;
   document.getElementById('pSource').innerHTML =
-    (live ? 'Quelle: VDP-ZH (live)' : 'Quelle: Demo-Simulation') +
+    (isReal ? 'Quelle: VDP-ZH (Tages-Historie)' : 'Quelle: Demo-Simulation') +
     ` · <a href="${station.gis}" target="_blank" rel="noopener" style="color:inherit">GIS-Browser ↗</a>`;
+  document.getElementById('pLiveRow').style.display = 'none';
 
-  drawChart(series);
+  drawChart(history);
 
   if (cached === undefined) {
     const street = await resolveStreetName(station);
@@ -675,27 +714,27 @@ async function selectStation(station, marker) {
     }
   }
 
-  // Echtzeit-Einzelwert nachladen — genau EIN Request, nur für diese
-  // eine Messstelle, ausgelöst durch den Klick.
+  // Echtzeit-Einzelwert nachladen — genau EIN Request, nur für diese eine
+  // Messstelle, ausgelöst durch den Klick. Ergänzt die Tages-Historie um
+  // einen "Live jetzt"-Wert, ersetzt sie aber nicht (andere Einheit: ein
+  // 15-Min-Intervall statt eines Tageswerts).
   const liveValue = await fetchLiveForStation(station);
   if (myToken === selectionToken && liveValue != null) {
-    document.getElementById('pStatCurrent').textContent = liveValue.toLocaleString('de-CH');
-    document.getElementById('pUpdated').textContent = 'aktualisiert gerade eben (Live)';
-    document.getElementById('pSource').innerHTML =
-      'Quelle: VDP-ZH (Live-Einzelabfrage)' +
-      ` · <a href="${station.gis}" target="_blank" rel="noopener" style="color:inherit">GIS-Browser ↗</a>`;
+    document.getElementById('pLiveRow').style.display = '';
+    document.getElementById('pLiveValue').textContent = liveValue.toLocaleString('de-CH') + ' Fz. / 15 Min';
 
     const cap = fifteenMinCapacity(station);
-    const updatedSnap = { ...snap, current: liveValue, loadRatio: Math.max(0, Math.min(1, liveValue / cap)) };
+    const liveRatio = Math.max(0, Math.min(1, liveValue / cap));
+    const updatedSnap = { ...snap, liveValue, loadRatio: liveRatio };
     STATION_SNAPSHOTS.set(station.id, updatedSnap);
-    updateMarkerVisual(station); // nur DIESER eine Marker wird eingefärbt aktualisiert
+    updateMarkerVisual(station); // nur DIESER eine Marker wird eingefärbt aktualisiert (mit Live-Wert)
   }
 }
 
-function drawChart(series) {
+function drawChart(history) {
   const ctx = document.getElementById('volChart').getContext('2d');
-  const labels = series.map(p => fmtTime(p.time));
-  const values = series.map(p => p.value);
+  const labels = history.map(e => e.date.slice(5).replace('-', '.')); // "08.27" statt volles ISO-Datum
+  const values = history.map(e => e.value);
 
   if (volChart) volChart.destroy();
   volChart = new Chart(ctx, {
@@ -708,7 +747,7 @@ function drawChart(series) {
           i === values.length - 1 ? '#c05a2c' : 'rgba(192,90,44,0.35)'
         ),
         borderRadius: 2,
-        maxBarThickness: 18
+        maxBarThickness: 32
       }]
     },
     options: {
@@ -723,14 +762,14 @@ function drawChart(series) {
           titleFont: { size: 11 },
           bodyFont: { size: 11 },
           callbacks: {
-            label: (item) => item.parsed.y.toLocaleString('de-CH') + ' Fz. / 15 Min'
+            label: (item) => item.parsed.y.toLocaleString('de-CH') + ' Fz. an diesem Tag'
           }
         }
       },
       scales: {
         x: {
           grid: { display: false },
-          ticks: { font: { size: 9, family: 'monospace' }, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }
+          ticks: { font: { size: 10, family: 'monospace' }, maxRotation: 0 }
         },
         y: {
           grid: { color: '#e5e9e3' },
@@ -745,25 +784,26 @@ function drawChart(series) {
 // ------------------------------------------------------------
 // Boot
 // ------------------------------------------------------------
-let LIVE_VALUES = null;
+let HISTORY = null;
 
 async function init() {
-  LIVE_VALUES = await tryLoadLiveValues(); // vor den Snapshots laden, damit echte Werte einfliessen können
-  DEMO_MODE = !LIVE_VALUES;
+  HISTORY = await loadHistory(); // vor den Snapshots laden, damit echte Werte einfliessen können
+  DEMO_MODE = !HISTORY;
   refreshAllSnapshots();
-  renderStations(STATIONS); // Geodaten sind immer echt -> sofort alle 358 Messstellen einfärben
+  renderStations(STATIONS); // Geodaten sind immer echt -> sofort alle Messstellen einfärben
   setStatus(DEMO_MODE ? 'demo' : 'live');
 }
 
 init();
 
-// Basis-Refresh stündlich (passend zum GitHub-Actions-Takt): Werte aus
-// latest.json + Snapshots neu berechnen, alle Marker (Farbe/Pfeil/Tooltip)
-// aktualisieren. Der Echtzeit-Einzelwert einer offenen Messstelle wird
-// zusätzlich frisch nachgeladen (fetchLiveForStation in selectStation).
+// Basis-Refresh täglich (passend zum GitHub-Actions-Takt — der Job läuft
+// nur noch 1x/Tag, siehe join_traffic_data.py): Historie + Snapshots neu
+// laden, alle Marker (Farbe/Pfeil/Tooltip) aktualisieren. Der Echtzeit-
+// Einzelwert einer offenen Messstelle wird weiterhin bei jedem Klick frisch
+// nachgeladen (fetchLiveForStation in selectStation) — unabhängig davon.
 setInterval(async () => {
-  LIVE_VALUES = await tryLoadLiveValues();
-  DEMO_MODE = !LIVE_VALUES;
+  HISTORY = await loadHistory();
+  DEMO_MODE = !HISTORY;
   refreshAllSnapshots();
   STATIONS.forEach(updateMarkerVisual);
   setStatus(DEMO_MODE ? 'demo' : 'live');
@@ -774,7 +814,7 @@ setInterval(async () => {
     const st = STATIONS_BY_ID.get(id);
     if (st) selectStation(st, st._marker);
   }
-}, 60 * 60 * 1000);
+}, 24 * 60 * 60 * 1000);
 </script>
 
 </body>
