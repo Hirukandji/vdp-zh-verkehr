@@ -373,7 +373,9 @@ function extractNumericId(uidLike) {
 }
 
 function formatUid(station) {
-  return 'M0' + station.id; // Anzeige-Konvention, ggf. anpassen sobald echtes Format bekannt ist
+  // Bestätigte Regel: "M" + 4-stellige, mit führenden Nullen aufgefüllte
+  // Messstellen-Nummer (z.B. 88 -> M0088, 5091 -> M5091).
+  return 'M' + String(station.id).padStart(4, '0');
 }
 
 // ------------------------------------------------------------
@@ -434,7 +436,7 @@ async function tryLoadLiveValues() {
 // ------------------------------------------------------------
 async function fetchLiveForStation(station) {
   try {
-    const url = `${BASE_URL}/VDP/M0${station.id}?sampleOnly=true`;
+    const url = `${BASE_URL}/VDP/${formatUid(station)}?sampleOnly=true`;
     const res = await fetch(url, { method: 'GET' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
