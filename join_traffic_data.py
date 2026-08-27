@@ -3,25 +3,30 @@ Wird stündlich von GitHub Actions ausgeführt (Basis-Daten für alle
 358 Messstellen). Echtzeitwerte für eine einzelne, angeklickte
 Messstelle holt sich das Frontend separat und nur bei Bedarf direkt
 von VDP-ZH — dieses Skript ist dafür nicht zuständig.
+
 Fragt für jede der 358 Messstellen einzeln die aktuelle Verkehrsmenge bei
 VDP-ZH ab (ein Request pro Messstelle, wie es die API laut Swagger-UI
 verlangt: /readOnlineAggregationData/VDP/{uid}?sampleOnly=true) und
 schreibt das Ergebnis als latest.json, die das Frontend danach lädt.
+
+Die 358 Requests laufen PARALLEL (Thread-Pool), nicht nacheinander —
+sequenziell mit Timeout würde bei ein paar langsamen Antworten leicht
+das 10-Minuten-Zeitlimit von GitHub Actions sprengen.
 """
 
 import json
 import os
 import sys
-import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 BASE_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData"
 STATIONS_FILE = "stations.json"   # deine 358 Messstellen, id = MESSST_NR
 OUTPUT_FILE = "latest.json"
-REQUEST_DELAY_SECONDS = 0.15      # kleine Pause zwischen Requests, aus Fairness gegenüber dem Server
-REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_TIMEOUT_SECONDS = 8       # eher kurz halten, damit einzelne Hänger nicht das Zeitbudget sprengen
+MAX_PARALLEL_REQUESTS = 20        # gleichzeitige Anfragen — genug Beschleunigung, ohne den Server zu bombardieren
 
 HEADERS = {
     # Möglichst wie ein echter Browser-Request wirken, da manche Server/
@@ -87,8 +92,7 @@ def fetch_station(station_id: int) -> tuple[float | None, str | None]:
         return None, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         # TimeoutError/OSError fängt auch rohe Socket-/SSL-Timeouts ab, die
-        # urllib nicht immer sauber in URLError verpackt — sonst stürzt das
-        # ganze Skript bei einem einzigen langsamen Server-Antwortversuch ab.
+        # urllib nicht immer sauber in URLError verpackt.
         return None, f"Verbindung fehlgeschlagen ({e})"
 
     try:
@@ -102,6 +106,16 @@ def fetch_station(station_id: int) -> tuple[float | None, str | None]:
     return flow, None
 
 
+def fetch_station_safe(station_id: int) -> tuple[int, float | None, str | None]:
+    """Wrapper fürs Thread-Pool: fängt auch unerwartete Fehler ab, damit ein
+    einzelner Ausreisser nicht den ganzen Lauf gefährdet."""
+    try:
+        flow, error = fetch_station(station_id)
+    except Exception as e:
+        flow, error = None, f"unerwarteter Fehler ({e})"
+    return station_id, flow, error
+
+
 def main():
     stations = load_stations()
     now = datetime.now(timezone.utc).isoformat()
@@ -110,26 +124,22 @@ def main():
     ok, failed = 0, 0
     error_samples = []
 
-    for station in stations:
-        station_id = station["id"]
-        try:
-            flow, error = fetch_station(station_id)
-        except Exception as e:  # Sicherheitsnetz: kein einzelner Ausreisser darf den ganzen Lauf stoppen
-            flow, error = None, f"unerwarteter Fehler ({e})"
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_REQUESTS) as pool:
+        futures = [pool.submit(fetch_station_safe, s["id"]) for s in stations]
+        for future in as_completed(futures):
+            station_id, flow, error = future.result()
 
-        if error is not None:
-            failed += 1
-            if len(error_samples) < 5:
-                error_samples.append(f"M0{station_id}: {error}")
-            time.sleep(REQUEST_DELAY_SECONDS)
-            continue
+            if error is not None:
+                failed += 1
+                if len(error_samples) < 5:
+                    error_samples.append(f"M0{station_id}: {error}")
+                continue
 
-        result["stations"][str(station_id)] = {
-            "current": flow,
-            "fetched_at": now,
-        }
-        ok += 1
-        time.sleep(REQUEST_DELAY_SECONDS)
+            result["stations"][str(station_id)] = {
+                "current": flow,
+                "fetched_at": now,
+            }
+            ok += 1
 
     print(f"Abgefragt: {ok} erfolgreich, {failed} fehlgeschlagen (von {len(stations)} Messstellen).")
     if error_samples:
