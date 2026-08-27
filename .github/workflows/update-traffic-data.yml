@@ -1,25 +1,25 @@
-name: Update traffic data
+name: Update traffic history
 
 on:
   schedule:
-    # Stündlicher Basis-Abruf ALLER 358 Messstellen (nicht mehr alle 15 Min) —
-    # das hält die Anzahl Requests an VDP-ZH niedrig. Echtzeitwerte für eine
-    # einzelne, gerade angeklickte Messstelle holt sich das Frontend direkt
-    # und nur bei Bedarf, siehe fetchLiveForStation() in index.html.
-    - cron: "0 * * * *"
+    # EINMAL PRO TAG (nicht mehr stündlich) -- 329 Anfragen/Stunde haben den
+    # Server überlastet (Massen-Timeouts in früheren Läufen). 18:00 UTC =
+    # 19:00/20:00 Lokalzeit (je nach Sommer-/Winterzeit), damit der Wert den
+    # Nachmittagsverkehr abbildet statt einer nächtlichen Ruhephase.
+    - cron: "0 18 * * *"
   workflow_dispatch: {} # erlaubt manuelles Auslösen über die GitHub-UI
 
 permissions:
-  contents: write # nötig, damit der Job latest.json zurück ins Repo committen darf
+  contents: write # nötig, damit der Job history.json zurück ins Repo committen darf
 
 concurrency:
-  group: update-traffic-data
-  cancel-in-progress: false # laufenden Commit nicht abbrechen, nächsten Lauf lieber überspringen
+  group: update-traffic-history
+  cancel-in-progress: false
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 10 # 358 Einzel-Requests nacheinander brauchen ein paar Minuten
+    timeout-minutes: 25 # bewusst schonende, langsame Abfrage (MAX_PARALLEL_REQUESTS=4)
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
@@ -29,13 +29,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: VDP-ZH abfragen (alle Messstellen), Ergebnis speichern
+      - name: VDP-ZH abfragen, Tages-Historie aktualisieren
         run: python join_traffic_data.py
 
-      - name: latest.json committen, falls sich etwas geändert hat
+      - name: history.json committen, falls sich etwas geändert hat
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add latest.json
-          git diff --staged --quiet || git commit -m "Verkehrsdaten aktualisiert $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git add history.json
+          git diff --staged --quiet || git commit -m "Tages-Historie aktualisiert $(date -u +%Y-%m-%d)"
           git push
