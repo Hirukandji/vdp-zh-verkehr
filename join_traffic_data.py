@@ -1,15 +1,19 @@
 """
 Wird stündlich von GitHub Actions ausgeführt (Basis-Daten für alle
-358 Messstellen). Echtzeitwerte für eine einzelne, angeklickte
-Messstelle holt sich das Frontend separat und nur bei Bedarf direkt
-von VDP-ZH — dieses Skript ist dafür nicht zuständig.
+329 aktiven Messstellen — von ursprünglich 358 aus der Excel-Liste
+sind 24 laut echtem Collector-Status DISABLED/IMPORTED und damit
+nicht über die Echtzeit-API abfragbar; 5 weitere waren nicht in der
+Collector-Liste auffindbar. Diese wurden vorab herausgefiltert).
+Echtzeitwerte für eine einzelne, angeklickte Messstelle holt sich
+das Frontend separat und nur bei Bedarf direkt von VDP-ZH — dieses
+Skript ist dafür nicht zuständig.
 
-Fragt für jede der 358 Messstellen einzeln die aktuelle Verkehrsmenge bei
+Fragt für jede aktive Messstelle einzeln die aktuelle Verkehrsmenge bei
 VDP-ZH ab (ein Request pro Messstelle, wie es die API laut Swagger-UI
 verlangt: /readOnlineAggregationData/VDP/{uid}?sampleOnly=true) und
 schreibt das Ergebnis als latest.json, die das Frontend danach lädt.
 
-Die 358 Requests laufen PARALLEL (Thread-Pool), nicht nacheinander —
+Die Requests laufen PARALLEL (Thread-Pool), nicht nacheinander —
 sequenziell mit Timeout würde bei ein paar langsamen Antworten leicht
 das 10-Minuten-Zeitlimit von GitHub Actions sprengen.
 """
@@ -17,16 +21,18 @@ das 10-Minuten-Zeitlimit von GitHub Actions sprengen.
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 BASE_URL = "https://vdp.zh.ch/pws/public-service/readOnlineAggregationData"
-STATIONS_FILE = "stations.json"   # deine 358 Messstellen, id = MESSST_NR
+STATIONS_FILE = "stations.json"   # deine 329 aktive Messstellen, id = MESSST_NR
 OUTPUT_FILE = "latest.json"
 REQUEST_TIMEOUT_SECONDS = 8       # eher kurz halten, damit einzelne Hänger nicht das Zeitbudget sprengen
-MAX_PARALLEL_REQUESTS = 20        # gleichzeitige Anfragen — genug Beschleunigung, ohne den Server zu bombardieren
+MAX_PARALLEL_REQUESTS = 10        # etwas zurückhaltender als zuvor (20), um den Server nicht zu überlasten
+CONNECTION_RETRY_COUNT = 2        # bei reinen Verbindungs-/Timeout-Fehlern (nicht bei HTTP-Fehlercodes) erneut versuchen
 
 HEADERS = {
     # Möglichst wie ein echter Browser-Request wirken, da manche Server/
@@ -84,18 +90,28 @@ def sum_flow(payload) -> float | None:
 
 
 def fetch_station(station_id: int) -> tuple[float | None, str | None]:
-    """Gibt (aktueller_wert, fehlermeldung) zurück — genau eines von beidem ist None."""
+    """Gibt (aktueller_wert, fehlermeldung) zurück — genau eines von beidem ist None.
+    Bei reinen Verbindungs-/Timeout-Fehlern (nicht bei HTTP-Fehlercodes wie 404,
+    die eine echte Antwort des Servers sind) wird kurz erneut versucht — das
+    unterscheidet einen kurzen Netzwerk-Ausrutscher von einem echten Ausfall."""
     url = f"{BASE_URL}/VDP/{uid_for(station_id)}?sampleOnly=true"
     request = urllib.request.Request(url, headers=HEADERS)
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as e:
-        return None, f"HTTP {e.code}"
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        # TimeoutError/OSError fängt auch rohe Socket-/SSL-Timeouts ab, die
-        # urllib nicht immer sauber in URLError verpackt.
-        return None, f"Verbindung fehlgeschlagen ({e})"
+
+    last_conn_error = None
+    for attempt in range(CONNECTION_RETRY_COUNT):
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+                raw = resp.read()
+            break  # Erfolg -> Retry-Schleife verlassen
+        except urllib.error.HTTPError as e:
+            return None, f"HTTP {e.code}"  # echte Serverantwort, kein Verbindungsproblem -> kein Retry
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_conn_error = e
+            if attempt < CONNECTION_RETRY_COUNT - 1:
+                time.sleep(0.5)
+            continue
+    else:
+        return None, f"Verbindung fehlgeschlagen nach {CONNECTION_RETRY_COUNT} Versuchen ({last_conn_error})"
 
     try:
         payload = json.loads(raw)
